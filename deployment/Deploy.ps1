@@ -324,8 +324,15 @@ if (!($ADMTApplicationIDPortal)) {
 if (!(Test-Path '../Publish')) {		
 	Write-host "📜 Prepare publish files for the application"
 	dotnet publish ../src/AdminSite/AdminSite.csproj -c release -o ../Publish/AdminSite/ -v q
-	dotnet publish ../src/MeteredTriggerJob/MeteredTriggerJob.csproj -c release -o ../Publish/AdminSite/app_data/jobs/triggered/MeteredTriggerJob/ -v q --runtime win-x64 --self-contained true 
+    
+    # FIX: Added -p:PublishReadyToRun=false to prevent OOM (Exit code 137) during crossgen2
+	Write-host "   🔵 Preparing Metered Scheduler (ReadyToRun disabled for memory safety)"
+	dotnet publish ../src/MeteredTriggerJob/MeteredTriggerJob.csproj -c release -o ../Publish/AdminSite/app_data/jobs/triggered/MeteredTriggerJob/ -v q --runtime win-x64 --self-contained true -p:PublishReadyToRun=false
+
+	Write-host "   🔵 Preparing Customer Site"
 	dotnet publish ../src/CustomerSite/CustomerSite.csproj -c release -o ../Publish/CustomerSite/ -v q
+
+	Write-host "   🔵 Zipping packages"
 	Compress-Archive -Path ../Publish/AdminSite/* -DestinationPath ../Publish/AdminSite.zip -Force
 	Compress-Archive -Path ../Publish/CustomerSite/* -DestinationPath ../Publish/CustomerSite.zip -Force
 }
