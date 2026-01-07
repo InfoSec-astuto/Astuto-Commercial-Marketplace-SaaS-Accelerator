@@ -1,4 +1,4 @@
-﻿# Copyright (c) Microsoft Corporation. All rights reserved.
+# Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License. See LICENSE file in the project root for license information.
 
 #
@@ -30,6 +30,39 @@ Param(
    [switch][Parameter()]$Quiet #if set, only show error / warning output from script commands
 )
 
+# ---------------------------------------------------------------------------
+# Helper Function: Retry-Command
+# Handles transient failures, AAD propagation delays, and ARM race conditions
+# ---------------------------------------------------------------------------
+function Retry-Command {
+    param (
+        [ScriptBlock]$Command,
+        [int]$MaxRetries = 10,
+        [int]$DelaySeconds = 10,
+        [string]$ActivityName = "Operation"
+    )
+
+    $retryCount = 0
+    $completed = $false
+
+    while (-not $completed) {
+        try {
+            & $Command
+            $completed = $true
+        }
+        catch {
+            $retryCount++
+            if ($retryCount -ge $MaxRetries) {
+                Write-Host "❌ [$ActivityName] failed after $MaxRetries attempts." -ForegroundColor Red
+                throw $_
+            }
+            Write-Host "⚠️  [$ActivityName] failed. Retrying in $DelaySeconds seconds... ($retryCount/$MaxRetries)" -ForegroundColor Yellow
+            Write-Host "    Error: $($_.Exception.Message)" -ForegroundColor DarkGray
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+}
+
 # Define the warning message
 $message = @"
 The SaaS Accelerator is offered under the MIT License as open source software and is not supported by Microsoft.
@@ -54,10 +87,6 @@ if ($response -ne 'Y' -and $response -ne 'y') {
 # Proceed if the user agrees
 Write-Host "Thank you for agreeing. Proceeding with the script..." -ForegroundColor Green
 
-# Make sure to install Az Module before running this script
-# Install-Module Az
-# Install-Module -Name AzureAD
-
 #region Select Tenant / Subscription for deployment
 
 $currentContext = az account show | ConvertFrom-Json
@@ -87,42 +116,9 @@ az account set -s $AzureSubscriptionID
 Write-Host "🔑 Azure Subscription '$AzureSubscriptionID' selected."
 
 #endregion
-
-
 
 $ErrorActionPreference = "Stop"
 $startTime = Get-Date
-#region Select Tenant / Subscription for deployment
-
-$currentContext = az account show | ConvertFrom-Json
-$currentTenant = $currentContext.tenantId
-$currentSubscription = $currentContext.id
-
-#Get TenantID if not set as argument
-if(!($TenantID)) {    
-    Get-AzTenant | Format-Table
-    if (!($TenantID = Read-Host "⌨  Type your TenantID or press Enter to accept your current one [$currentTenant]")) { $TenantID = $currentTenant }    
-}
-else {
-    Write-Host "🔑 Tenant provided: $TenantID"
-}
-
-#Get Azure Subscription if not set as argument
-if(!($AzureSubscriptionID)) {    
-    Get-AzSubscription -TenantId $TenantID | Format-Table
-    if (!($AzureSubscriptionID = Read-Host "⌨  Type your SubscriptionID or press Enter to accept your current one [$currentSubscription]")) { $AzureSubscriptionID = $currentSubscription }
-}
-else {
-    Write-Host "🔑 Azure Subscription provided: $AzureSubscriptionID"
-}
-
-#Set the AZ Cli context
-az account set -s $AzureSubscriptionID
-Write-Host "🔑 Azure Subscription '$AzureSubscriptionID' selected."
-
-#endregion
-
-
 
 
 #region Set up Variables and Default Parameters
@@ -273,10 +269,6 @@ else {
 }
 
 
-
-
-
-
 #Create App Registration for authenticating calls to the Marketplace API
 if (!($ADApplicationID)) {   
     Write-Host "🔑 Creating Fulfilment API App Registration"
@@ -284,10 +276,16 @@ if (!($ADApplicationID)) {
         $ADApplication = az ad app create --only-show-errors --sign-in-audience AzureADMYOrg --display-name "$WebAppNamePrefix-FulfillmentAppReg" | ConvertFrom-Json
 		$ADObjectID = $ADApplication.id
         $ADApplicationID = $ADApplication.appId
-        sleep 5 #this is to give time to AAD to register
-		# create service principal
-		az ad sp create --id $ADApplicationID
-        $ADApplicationSecret = az ad app credential reset --id $ADObjectID --append --display-name 'SaaSAPI' --years 2 --query password --only-show-errors --output tsv
+        
+        # RACE CONDITION FIX: Retry Service Principal creation (AAD Latency)
+        Retry-Command -ActivityName "Create SP for Fulfillment App" -Command {
+            az ad sp create --id $ADApplicationID
+        }
+        
+        # RACE CONDITION FIX: Retry Credential Reset
+        Retry-Command -ActivityName "Reset Credential" -Command {
+            $Script:ADApplicationSecret = az ad app credential reset --id $ADObjectID --append --display-name 'SaaSAPI' --years 2 --query password --only-show-errors --output tsv
+        }
 				
         Write-Host "   🔵 FulfilmentAPI App Registration created."
 		Write-Host "      ➡️ Application ID:" $ADApplicationID
@@ -337,8 +335,6 @@ if (!($ADApplicationIDAdmin)) {
 }
 "@	
 		if ($PsVersionTable.Platform -ne 'Unix') {
-			#On Windows, we need to escape quotes and remove new lines before sending the payload to az rest. 
-			# See: https://github.com/Azure/azure-cli/blob/dev/doc/quoting-issues-with-powershell.md#double-quotes--are-lost
 			$appCreateRequestBodyJson = $appCreateRequestBodyJson.replace('"','\"').replace("`r`n","")
 		}
 
@@ -415,8 +411,6 @@ if (!($ADMTApplicationIDPortal)) {
 }
 "@	
 		if ($PsVersionTable.Platform -ne 'Unix') {
-			#On Windows, we need to escape quotes and remove new lines before sending the payload to az rest. 
-			# See: https://github.com/Azure/azure-cli/blob/dev/doc/quoting-issues-with-powershell.md#double-quotes--are-lost
 			$appCreateRequestBodyJson = $appCreateRequestBodyJson.replace('"','\"').replace("`r`n","")
 		}
 
@@ -492,7 +486,7 @@ $SqlSubnetName="sql"
 $KvSubnetName="kv"
 $DefaultSubnetName="default"
 
-#keep the space at the end of the string - bug in az cli running on windows powershell truncates last char https://github.com/Azure/azure-cli/issues/10066
+#keep the space at the end of the string - bug in az cli running on windows powershell truncates last char
 $ADApplicationSecretKeyVault="@Microsoft.KeyVault(VaultName=$KeyVault;SecretName=ADApplicationSecret) "
 $DefaultConnectionKeyVault="@Microsoft.KeyVault(VaultName=$KeyVault;SecretName=DefaultConnection) "
 $ServerUri = $SQLServerName+".database.windows.net"
@@ -503,25 +497,53 @@ Write-host "   🔵 Resource Group"
 Write-host "      ➡️ Create Resource Group"
 az group create --location $Location --name $ResourceGroupForDeployment --output $azCliOutput
 
-Write-host "      ➡️ Create VNET and Subnet"
+Write-host "      ➡️ Create VNET and Subnets"
+# RACE CONDITION FIX: Create VNet first and verify existence
 az network vnet create --resource-group $ResourceGroupForDeployment --name $VnetName --address-prefixes "10.0.0.0/20" --output $azCliOutput
+
+# Check VNet existence loop (Wait for ARM propagation)
+Retry-Command -ActivityName "Verify VNet Existence" -Command {
+    $vnetStatus = az network vnet show --resource-group $ResourceGroupForDeployment --name $VnetName --query provisioningState -o tsv
+    if ($vnetStatus -ne "Succeeded") { throw "VNet not ready yet." }
+}
+
+# Now safe to create subnets
+Write-host "      ➡️ Creating Subnets..."
 az network vnet subnet create --resource-group $ResourceGroupForDeployment --vnet-name $VnetName -n $DefaultSubnetName --address-prefixes "10.0.0.0/24" --output $azCliOutput
-az network vnet subnet create --resource-group $ResourceGroupForDeployment --vnet-name $VnetName -n $WebSubnetName --address-prefixes "10.0.1.0/24" --service-endpoints Microsoft.Sql Microsoft.KeyVault --delegations Microsoft.Web/serverfarms  --output $azCliOutput 
+
+# The specific failure point from your logs - fixed by retrying/waiting for VNet
+Retry-Command -ActivityName "Create Web Subnet" -Command {
+    az network vnet subnet create --resource-group $ResourceGroupForDeployment --vnet-name $VnetName -n $WebSubnetName --address-prefixes "10.0.1.0/24" --service-endpoints Microsoft.Sql Microsoft.KeyVault --delegations Microsoft.Web/serverfarms --output $azCliOutput 
+}
 az network vnet subnet create --resource-group $ResourceGroupForDeployment --vnet-name $VnetName -n $SqlSubnetName --address-prefixes "10.0.2.0/24"  --output $azCliOutput 
 az network vnet subnet create --resource-group $ResourceGroupForDeployment --vnet-name $VnetName -n $KvSubnetName --address-prefixes "10.0.3.0/24"   --output $azCliOutput 
+
 
 Write-host "      ➡️ Create Sql Server"
 $userId = az ad signed-in-user show --query id -o tsv 
 $userdisplayname = az ad signed-in-user show --query displayName -o tsv 
 az sql server create --name $SQLServerName --resource-group $ResourceGroupForDeployment --location $Location  --enable-ad-only-auth --external-admin-principal-type User --external-admin-name $userdisplayname --external-admin-sid $userId --output $azCliOutput
+
 Write-host "      ➡️ Set minimalTlsVersion to 1.2"
-az sql server update --name $SQLServerName --resource-group $ResourceGroupForDeployment --set minimalTlsVersion="1.2"
+Retry-Command -ActivityName "Update SQL TLS" -Command {
+    az sql server update --name $SQLServerName --resource-group $ResourceGroupForDeployment --set minimalTlsVersion="1.2"
+}
+
 Write-host "      ➡️ Add SQL Server Firewall rules"
 az sql server firewall-rule create --resource-group $ResourceGroupForDeployment --server $SQLServerName -n AllowAzureIP --start-ip-address "0.0.0.0" --end-ip-address "0.0.0.0" --output $azCliOutput
+
 if ($env:ACC_CLOUD -eq $null){
     Write-host "      ➡️ Running in local environment - Add current IP to firewall"
-	$publicIp = (Invoke-WebRequest -uri "https://api.ipify.org").Content
-    az sql server firewall-rule create --resource-group $ResourceGroupForDeployment --server $SQLServerName -n AllowIP --start-ip-address "$publicIp" --end-ip-address "$publicIp" --output $azCliOutput
+    try {
+        $publicIp = (Invoke-WebRequest -uri "https://api.ipify.org" -UseBasicParsing).Content
+        if ($publicIp) {
+            Retry-Command -ActivityName "Add Client IP to SQL" -Command {
+                az sql server firewall-rule create --resource-group $ResourceGroupForDeployment --server $SQLServerName -n AllowIP --start-ip-address "$publicIp" --end-ip-address "$publicIp" --output $azCliOutput
+            }
+        }
+    } catch {
+        Write-Host "⚠️  Could not detect public IP or add firewall rule. You may need to add it manually." -ForegroundColor Yellow
+    }
 }
 
 Write-host "      ➡️ Create SQL DB"
@@ -530,9 +552,16 @@ az sql db create --resource-group $ResourceGroupForDeployment --server $SQLServe
 Write-host "   🔵 KeyVault"
 Write-host "      ➡️ Create KeyVault"
 az keyvault create --name $KeyVault --resource-group $ResourceGroupForDeployment --enable-rbac-authorization false --output $azCliOutput
+
 Write-host "      ➡️ Add Secrets"
-az keyvault secret set --vault-name $KeyVault --name ADApplicationSecret --value="$ADApplicationSecret" --output $azCliOutput
-az keyvault secret set --vault-name $KeyVault --name DefaultConnection --value $Connection --output $azCliOutput
+# Wrap secret setting in retry
+Retry-Command -ActivityName "Set AD Secret" -Command {
+    az keyvault secret set --vault-name $KeyVault --name ADApplicationSecret --value="$ADApplicationSecret" --output $azCliOutput
+}
+Retry-Command -ActivityName "Set Connection Secret" -Command {
+    az keyvault secret set --vault-name $KeyVault --name DefaultConnection --value $Connection --output $azCliOutput
+}
+
 Write-host "      ➡️ Update Firewall"
 az keyvault update --name $KeyVault --resource-group $ResourceGroupForDeployment --default-action Deny --output $azCliOutput
 az keyvault network-rule add --name $KeyVault --resource-group $ResourceGroupForDeployment --vnet-name $VnetName --subnet $WebSubnetName --output $azCliOutput
@@ -544,10 +573,15 @@ az appservice plan create -g $ResourceGroupForDeployment -n $WebAppNameService -
 Write-host "   🔵 Admin Portal WebApp"
 Write-host "      ➡️ Create Web App"
 az webapp create -g $ResourceGroupForDeployment -p $WebAppNameService -n $WebAppNameAdmin  --runtime dotnet:8 --output $azCliOutput
-Write-host "      ➡️ Assign Identity"
+
+Write-host "      ➡️ Assign Identity & Setup KeyVault Access"
 $WebAppNameAdminId = az webapp identity assign -g $ResourceGroupForDeployment  -n $WebAppNameAdmin --identities [system] --query principalId -o tsv
-Write-host "      ➡️ Setup access to KeyVault"
-az keyvault set-policy --name $KeyVault  --object-id $WebAppNameAdminId --secret-permissions get list --key-permissions get list --resource-group $ResourceGroupForDeployment --output $azCliOutput
+
+# RACE CONDITION FIX: Retry Policy Assignment (Managed Identity propagation latency)
+Retry-Command -ActivityName "AdminPortal KV Policy" -Command {
+    az keyvault set-policy --name $KeyVault  --object-id $WebAppNameAdminId --secret-permissions get list --key-permissions get list --resource-group $ResourceGroupForDeployment --output $azCliOutput
+}
+
 Write-host "      ➡️ Set Configuration"
 az webapp config connection-string set -g $ResourceGroupForDeployment -n $WebAppNameAdmin -t SQLAzure --output $azCliOutput --settings DefaultConnection=$DefaultConnectionKeyVault 
 az webapp config appsettings set -g $ResourceGroupForDeployment  -n $WebAppNameAdmin --output $azCliOutput --settings KnownUsers=$PublisherAdminUsers SaaSApiConfiguration__AdAuthenticationEndPoint=https://login.microsoftonline.com SaaSApiConfiguration__ClientId=$ADApplicationID SaaSApiConfiguration__ClientSecret=$ADApplicationSecretKeyVault SaaSApiConfiguration__FulFillmentAPIBaseURL=https://marketplaceapi.microsoft.com/api SaaSApiConfiguration__FulFillmentAPIVersion=2018-08-31 SaaSApiConfiguration__GrantType=client_credentials SaaSApiConfiguration__MTClientId=$ADApplicationIDAdmin SaaSApiConfiguration__IsAdminPortalMultiTenant=$IsAdminPortalMultiTenant SaaSApiConfiguration__Resource=20e940b3-4c77-4b0b-9a53-9e16a1b010a7 SaaSApiConfiguration__TenantId=$TenantID SaaSApiConfiguration__SignedOutRedirectUri=https://$WebAppNamePrefix-admin.azurewebsites.net/Home/Index/ SaaSApiConfiguration_CodeHash=$SaaSApiConfiguration_CodeHash
@@ -556,10 +590,15 @@ az webapp config set -g $ResourceGroupForDeployment -n $WebAppNameAdmin --always
 Write-host "   🔵 Customer Portal WebApp"
 Write-host "      ➡️ Create Web App"
 az webapp create -g $ResourceGroupForDeployment -p $WebAppNameService -n $WebAppNamePortal --runtime dotnet:8 --output $azCliOutput
-Write-host "      ➡️ Assign Identity"
+
+Write-host "      ➡️ Assign Identity & Setup KeyVault Access"
 $WebAppNamePortalId= az webapp identity assign -g $ResourceGroupForDeployment  -n $WebAppNamePortal --identities [system] --query principalId -o tsv 
-Write-host "      ➡️ Setup access to KeyVault"
-az keyvault set-policy --name $KeyVault  --object-id $WebAppNamePortalId --secret-permissions get list --key-permissions get list --resource-group $ResourceGroupForDeployment --output $azCliOutput
+
+# RACE CONDITION FIX: Retry Policy Assignment
+Retry-Command -ActivityName "CustomerPortal KV Policy" -Command {
+    az keyvault set-policy --name $KeyVault  --object-id $WebAppNamePortalId --secret-permissions get list --key-permissions get list --resource-group $ResourceGroupForDeployment --output $azCliOutput
+}
+
 Write-host "      ➡️ Set Configuration"
 az webapp config connection-string set -g $ResourceGroupForDeployment -n $WebAppNamePortal -t SQLAzure --output $azCliOutput --settings DefaultConnection=$DefaultConnectionKeyVault
 az webapp config appsettings set -g $ResourceGroupForDeployment  -n $WebAppNamePortal --output $azCliOutput --settings SaaSApiConfiguration__AdAuthenticationEndPoint=https://login.microsoftonline.com SaaSApiConfiguration__ClientId=$ADApplicationID SaaSApiConfiguration__ClientSecret=$ADApplicationSecretKeyVault SaaSApiConfiguration__FulFillmentAPIBaseURL=https://marketplaceapi.microsoft.com/api SaaSApiConfiguration__FulFillmentAPIVersion=2018-08-31 SaaSApiConfiguration__GrantType=client_credentials SaaSApiConfiguration__MTClientId=$ADMTApplicationIDPortal SaaSApiConfiguration__Resource=20e940b3-4c77-4b0b-9a53-9e16a1b010a7 SaaSApiConfiguration__TenantId=$TenantID SaaSApiConfiguration__SignedOutRedirectUri=https://$WebAppNamePrefix-portal.azurewebsites.net/Home/Index/ SaaSApiConfiguration_CodeHash=$SaaSApiConfiguration_CodeHash
@@ -575,12 +614,20 @@ Write-host "      ➡️ Generate SQL schema/data script"
 $ConnectionString="Server=tcp:"+$ServerUri+";Database="+$SQLDatabaseName+";Authentication=Active Directory Default;"
 Set-Content -Path ../src/AdminSite/appsettings.Development.json -value "{`"ConnectionStrings`": {`"DefaultConnection`":`"$ConnectionString`"}}"
 dotnet-ef migrations script  --output script.sql --idempotent --context SaaSKitContext --project ../src/DataAccess/DataAccess.csproj --startup-project ../src/AdminSite/AdminSite.csproj
+
 Write-host "      ➡️ Execute SQL schema/data script"
-Invoke-Sqlcmd -InputFile ./script.sql -ConnectionString $ConnectionString
+# RACE CONDITION FIX: Retry SQL Command (Database login/firewall propagation)
+Retry-Command -ActivityName "Execute SQL Migrations" -Command {
+    Invoke-Sqlcmd -InputFile ./script.sql -ConnectionString $ConnectionString
+}
 
 Write-host "      ➡️ Execute SQL script to Add WebApps"
 $AddAppsIdsToDB = "CREATE USER [$WebAppNameAdmin] FROM EXTERNAL PROVIDER;ALTER ROLE db_datareader ADD MEMBER  [$WebAppNameAdmin];ALTER ROLE db_datawriter ADD MEMBER  [$WebAppNameAdmin]; GRANT EXEC TO [$WebAppNameAdmin]; CREATE USER [$WebAppNamePortal] FROM EXTERNAL PROVIDER;ALTER ROLE db_datareader ADD MEMBER [$WebAppNamePortal];ALTER ROLE db_datawriter ADD MEMBER [$WebAppNamePortal]; GRANT EXEC TO [$WebAppNamePortal];"
-Invoke-Sqlcmd -Query $AddAppsIdsToDB -ConnectionString $ConnectionString
+
+# RACE CONDITION FIX: Retry User Creation (AAD Sync to SQL)
+Retry-Command -ActivityName "Add DB Users" -Command {
+    Invoke-Sqlcmd -Query $AddAppsIdsToDB -ConnectionString $ConnectionString
+}
 
 Write-host "   🔵 Deploy Code to Admin Portal"
 az webapp deploy --resource-group $ResourceGroupForDeployment --name $WebAppNameAdmin --src-path "../Publish/AdminSite.zip" --type zip --output $azCliOutput
